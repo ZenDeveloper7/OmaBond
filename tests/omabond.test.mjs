@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   MAX_MESSAGE_LENGTH,
@@ -16,6 +19,8 @@ import {
   secretMatches
 } from "../scripts/omabond.mjs";
 
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+
 test("uses a dedicated unprivileged port", () => {
   assert.equal(PORT, 42831);
   assert.ok(PORT > 1024);
@@ -29,12 +34,27 @@ test("accepts only Tailscale CGNAT addresses", () => {
   assert.throws(() => normalizeHost("example.com"), /invalid Tailscale address/);
 });
 
+test("LAN test mode accepts only RFC1918 addresses", () => {
+  assert.equal(normalizeHost("10.0.2.15", "lan"), "10.0.2.15");
+  assert.equal(normalizeHost("172.16.0.1", "lan"), "172.16.0.1");
+  assert.equal(normalizeHost("192.168.1.5", "lan"), "192.168.1.5");
+  assert.throws(() => normalizeHost("100.64.0.1", "lan"), /invalid local network address/);
+  assert.throws(() => normalizeHost("127.0.0.1", "lan"), /invalid local network address/);
+  assert.throws(() => normalizeHost("8.8.8.8", "lan"), /invalid local network address/);
+});
+
 test("pairing codes round trip without weakening the secret", () => {
   const token = "A".repeat(43);
   const code = pairingCode({ host: "100.86.194.24", name: "Zen", token });
   assert.ok(code.startsWith("omabond:v1:"));
-  assert.deepEqual(parsePairingCode(code), { host: "100.86.194.24", name: "Zen", token });
+  assert.deepEqual(parsePairingCode(code), { transport: "tailscale", host: "100.86.194.24", name: "Zen", token });
   assert.throws(() => parsePairingCode("omabond:v1:not-json"), /Invalid OmaBond pairing code/);
+});
+
+test("LAN pairing codes retain their transport", () => {
+  const token = "B".repeat(43);
+  const code = pairingCode({ transport: "lan", host: "192.168.50.12", name: "Thor", token });
+  assert.deepEqual(parsePairingCode(code), { transport: "lan", host: "192.168.50.12", name: "Thor", token });
 });
 
 test("bearer comparison rejects missing and partial secrets", () => {
@@ -77,4 +97,18 @@ test("client input is parsed from stdin instead of command arguments", async () 
   const input = Readable.from(['{"text":"private hello"}\n']);
   assert.deepEqual(await readStdinJson(input), { text: "private hello" });
   await assert.rejects(readStdinJson(Readable.from(["not-json\n"])), /input must be JSON/);
+});
+
+test("peer-controlled QML Text values are always rendered as plain text", () => {
+  const source = fs.readFileSync(path.join(TEST_DIR, "..", "BarWidget.qml"), "utf8");
+  const dynamicTextBlocks = [
+    /text: root\.bondService && root\.bondService\.paired \? root\.peerEmoji\(\)[\s\S]{0,160}textFormat: Text\.PlainText/,
+    /text: root\.bondService && root\.bondService\.paired \? root\.peerName\(\)[\s\S]{0,160}textFormat: Text\.PlainText/,
+    /text: !root\.bondService \? "Starting…"[\s\S]{0,700}textFormat: Text\.PlainText/,
+    /text: root\.bondService \? root\.bondService\.errorText[\s\S]{0,160}textFormat: Text\.PlainText/,
+    /text: root\.peerEmoji\(\) \+ "  "[\s\S]{0,320}textFormat: Text\.PlainText/,
+    /text: \(modelData\.direction === "out"[\s\S]{0,360}textFormat: Text\.PlainText/,
+    /text: modelData\.text[\s\S]{0,120}textFormat: Text\.PlainText/
+  ];
+  for (const pattern of dynamicTextBlocks) assert.match(source, pattern);
 });

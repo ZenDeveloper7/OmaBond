@@ -13,8 +13,9 @@ Item {
   property string activeOperation: ""
   property string errorText: ""
   property string pairingCode: ""
-  property var tailscale: null
-  property string tailscaleError: ""
+  property string transportMode: "tailscale"
+  property var network: null
+  property string networkError: ""
   property bool paired: false
   property var selfProfile: ({ name: "", emoji: "💛", status: "" })
   property var peer: null
@@ -36,8 +37,9 @@ Item {
     }
     errorText = ""
     ready = payload.serviceReady === true
-    if (payload.tailscale !== undefined) tailscale = payload.tailscale
-    if (payload.tailscaleError !== undefined) tailscaleError = String(payload.tailscaleError || "")
+    if (payload.transportMode !== undefined) transportMode = String(payload.transportMode || "tailscale")
+    if (payload.network !== undefined) network = payload.network
+    if (payload.networkError !== undefined) networkError = String(payload.networkError || "")
     if (payload.paired !== undefined) paired = payload.paired === true
     if (payload.self !== undefined) selfProfile = payload.self || selfProfile
     if (payload.peer !== undefined) peer = payload.peer

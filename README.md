@@ -1,6 +1,6 @@
 # OmaBond
 
-OmaBond is a private Omarchy Quattro bar widget for two people. It shares presence, short statuses, nudges, and messages directly between two Omarchy systems through Tailscale—without a hosted relay or central message database.
+OmaBond is a private Omarchy Quattro bar widget for two people. It shares presence, short statuses, nudges, and messages directly between two Omarchy systems through Tailscale—without a hosted relay or central message database. An explicitly enabled local-network mode is available for same-LAN testing.
 
 The plugin ID is `zen.omabond`.
 
@@ -23,6 +23,22 @@ The plugin ID is `zen.omabond`.
 - `notify-send` for optional incoming-message notifications
 
 OmaBond does not install, enable, or reconfigure these dependencies.
+
+### Local-network test mode
+
+For testing two systems on the same trusted LAN without Tailscale, start the Omarchy shell with:
+
+```bash
+OMABOND_TRANSPORT=lan omarchy restart shell
+```
+
+If the system has more than one private IPv4 address, select the one shared with the other system:
+
+```bash
+OMABOND_TRANSPORT=lan OMABOND_LAN_IP=192.168.1.50 omarchy restart shell
+```
+
+Both systems must use LAN mode and must be able to reach each other on TCP port `42831`. For a VM, use a bridged or host-only adapter rather than plain VirtualBox NAT. LAN mode is deliberately opt-in and does not encrypt message traffic; use it only on a trusted network for testing. Restart the shell normally to return to the default Tailscale mode.
 
 ## Install
 

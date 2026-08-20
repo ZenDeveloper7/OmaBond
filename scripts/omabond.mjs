@@ -11,6 +11,8 @@ import { pathToFileURL } from "node:url";
 
 const APP_ID = "zen.omabond";
 const PORT = 42831;
+const TRANSPORT_MODE = process.env.OMABOND_TRANSPORT === "lan" ? "lan" : "tailscale";
+const LAN_IP_OVERRIDE = String(process.env.OMABOND_LAN_IP || "").trim();
 const MAX_BODY_BYTES = 16 * 1024;
 const MAX_MESSAGES = 100;
 const MAX_OUTBOX = 50;
@@ -30,13 +32,17 @@ function cleanText(value, limit) {
   return String(value || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, limit);
 }
 
-function normalizeHost(value) {
+function normalizeHost(value, mode = TRANSPORT_MODE) {
   const host = String(value || "").trim().replace(/\.$/, "").toLowerCase();
-  if (/^100(?:\.(?:[0-9]{1,3})){3}$/.test(host)) {
-    const parts = host.split(".").map(Number);
-    if (parts.every(part => part >= 0 && part <= 255) && parts[1] >= 64 && parts[1] <= 127) return host;
-  }
-  throw new Error("Pairing code contains an invalid Tailscale address");
+  const parts = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) ? host.split(".").map(Number) : [];
+  const valid = parts.length === 4 && parts.every(part => part >= 0 && part <= 255);
+  if (mode === "tailscale" && valid && parts[0] === 100 && parts[1] >= 64 && parts[1] <= 127) return host;
+  if (mode === "lan" && valid && (
+    parts[0] === 10
+    || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31)
+    || (parts[0] === 192 && parts[1] === 168)
+  )) return host;
+  throw new Error(`Pairing code contains an invalid ${mode === "lan" ? "local network" : "Tailscale"} address`);
 }
 
 function normalizeProfile(raw = {}) {
@@ -84,8 +90,11 @@ function normalizeState(raw) {
   let peer = null;
   if (raw.peer && typeof raw.peer === "object") {
     try {
+      const transport = raw.peer.transport === "lan" ? "lan" : "tailscale";
+      if (transport !== TRANSPORT_MODE) throw new Error("Stored peer uses a different transport");
       peer = {
-        host: normalizeHost(raw.peer.host),
+        host: normalizeHost(raw.peer.host, transport),
+        transport,
         name: cleanText(raw.peer.name, 40),
         pairedAt: String(raw.peer.pairedAt || nowIso())
       };
@@ -156,8 +165,33 @@ function tailscaleInfo() {
   };
 }
 
+function lanInfo() {
+  const candidates = [];
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries || []) {
+      if (entry.family !== "IPv4" || entry.internal) continue;
+      try { candidates.push(normalizeHost(entry.address, "lan")); }
+      catch (_) {}
+    }
+  }
+  const unique = [...new Set(candidates)];
+  if (LAN_IP_OVERRIDE) {
+    const ip = normalizeHost(LAN_IP_OVERRIDE, "lan");
+    if (!unique.includes(ip)) throw new Error(`OMABOND_LAN_IP ${ip} is not assigned to this device`);
+    return { online: true, ip, dnsName: os.hostname(), peerCount: 0, mode: "lan" };
+  }
+  if (unique.length === 0) throw new Error("No private local network IPv4 address is available");
+  if (unique.length > 1) throw new Error(`Multiple local addresses found; set OMABOND_LAN_IP to one of: ${unique.join(", ")}`);
+  return { online: true, ip: unique[0], dnsName: os.hostname(), peerCount: 0, mode: "lan" };
+}
+
+function transportInfo() {
+  return TRANSPORT_MODE === "lan" ? lanInfo() : { ...tailscaleInfo(), mode: "tailscale" };
+}
+
 function pairingCode(payload) {
-  const json = JSON.stringify({ v: 1, host: normalizeHost(payload.host), name: cleanText(payload.name, 40), token: payload.token });
+  const transport = payload.transport === "lan" ? "lan" : "tailscale";
+  const json = JSON.stringify({ v: 1, transport, host: normalizeHost(payload.host, transport), name: cleanText(payload.name, 40), token: payload.token });
   return `omabond:v1:${Buffer.from(json).toString("base64url")}`;
 }
 
@@ -168,7 +202,8 @@ function parsePairingCode(value) {
   try { payload = JSON.parse(Buffer.from(input.slice(11), "base64url").toString("utf8")); }
   catch (_) { throw new Error("Invalid OmaBond pairing code"); }
   if (payload?.v !== 1 || !/^[A-Za-z0-9_-]{43}$/.test(String(payload?.token || ""))) throw new Error("Invalid OmaBond pairing code");
-  return { host: normalizeHost(payload.host), name: cleanText(payload.name, 40), token: String(payload.token) };
+  const transport = payload.transport === "lan" ? "lan" : "tailscale";
+  return { transport, host: normalizeHost(payload.host, transport), name: cleanText(payload.name, 40), token: String(payload.token) };
 }
 
 function secretMatches(header, secret) {
@@ -203,7 +238,7 @@ function sendJson(response, status, payload) {
 }
 
 async function fetchPeer(host, route, secret, options = {}) {
-  const response = await fetch(`http://${normalizeHost(host)}:${PORT}${route}`, {
+  const response = await fetch(`http://${normalizeHost(host, TRANSPORT_MODE)}:${PORT}${route}`, {
     method: options.method || "GET",
     headers: {
       Authorization: `Bearer ${secret}`,
@@ -223,8 +258,9 @@ async function fetchPeer(host, route, secret, options = {}) {
 function publicState(state, daemon) {
   return {
     serviceReady: true,
-    tailscale: daemon.tailInfo || null,
-    tailscaleError: daemon.tailError || "",
+    transportMode: TRANSPORT_MODE,
+    network: daemon.networkInfo || null,
+    networkError: daemon.networkError || "",
     paired: Boolean(state.peer && daemon.secret),
     self: state.profile,
     peer: state.peer,
@@ -248,11 +284,11 @@ class OmaBondDaemon {
   constructor() {
     this.state = loadState();
     this.secret = "";
-    this.tailInfo = null;
-    this.tailError = "";
+    this.networkInfo = null;
+    this.networkError = "";
     this.localServer = null;
-    this.tailServer = null;
-    this.tailAddress = "";
+    this.peerServer = null;
+    this.listenAddress = "";
     this.syncing = false;
     this.rate = new Map();
   }
@@ -278,17 +314,17 @@ class OmaBondDaemon {
       case "status":
         return publicState(this.state, this);
       case "pair-code": {
-        if (!this.tailInfo) throw new Error(this.tailError || "Tailscale is not connected");
+        if (!this.networkInfo) throw new Error(this.networkError || "Transport is not ready");
         let secret = this.secret;
         if (!secret) {
           secret = crypto.randomBytes(32).toString("base64url");
           storePairSecret(secret);
           this.secret = secret;
         }
-        return { ...publicState(this.state, this), pairingCode: pairingCode({ host: this.tailInfo.ip, name: this.state.profile.name, token: secret }) };
+        return { ...publicState(this.state, this), pairingCode: pairingCode({ transport: TRANSPORT_MODE, host: this.networkInfo.ip, name: this.state.profile.name, token: secret }) };
       }
       case "pair-create": {
-        if (!this.tailInfo) throw new Error(this.tailError || "Tailscale is not connected");
+        if (!this.networkInfo) throw new Error(this.networkError || "Transport is not ready");
         const secret = crypto.randomBytes(32).toString("base64url");
         storePairSecret(secret);
         this.secret = secret;
@@ -299,14 +335,15 @@ class OmaBondDaemon {
         this.state.messages = [];
         this.state.outbox = [];
         this.persist();
-        return { ...publicState(this.state, this), pairingCode: pairingCode({ host: this.tailInfo.ip, name: this.state.profile.name, token: secret }) };
+        return { ...publicState(this.state, this), pairingCode: pairingCode({ transport: TRANSPORT_MODE, host: this.networkInfo.ip, name: this.state.profile.name, token: secret }) };
       }
       case "pair-import": {
         const parsed = parsePairingCode(input.code);
-        if (this.tailInfo && parsed.host === this.tailInfo.ip) throw new Error("That pairing code belongs to this device");
+        if (parsed.transport !== TRANSPORT_MODE) throw new Error(`That pairing code uses ${parsed.transport}; this device uses ${TRANSPORT_MODE}`);
+        if (this.networkInfo && parsed.host === this.networkInfo.ip) throw new Error("That pairing code belongs to this device");
         storePairSecret(parsed.token);
         this.secret = parsed.token;
-        this.state.peer = { host: parsed.host, name: parsed.name, pairedAt: nowIso() };
+        this.state.peer = { host: parsed.host, transport: parsed.transport, name: parsed.name, pairedAt: nowIso() };
         this.state.peerOnline = false;
         this.state.peerProfile = null;
         this.state.peerLastSeen = "";
@@ -366,14 +403,14 @@ class OmaBondDaemon {
     if (!this.secret || !secretMatches(request.headers.authorization, this.secret)) return sendJson(response, 401, { ok: false, error: "Pairing authentication failed" });
     try {
       if (request.method === "GET" && request.url === "/v1/snapshot") {
-        return sendJson(response, 200, { ok: true, profile: this.state.profile, endpoint: this.tailInfo?.ip || "", seenAt: nowIso() });
+        return sendJson(response, 200, { ok: true, profile: this.state.profile, endpoint: this.networkInfo?.ip || "", seenAt: nowIso() });
       }
       if (request.method === "POST" && request.url === "/v1/hello") {
         const body = await readJsonBody(request);
-        const host = normalizeHost(body.host);
-        if (this.tailInfo && host === this.tailInfo.ip) throw new Error("Peer endpoint cannot be this device");
+        const host = normalizeHost(body.host, TRANSPORT_MODE);
+        if (this.networkInfo && host === this.networkInfo.ip) throw new Error("Peer endpoint cannot be this device");
         if (this.state.peer && this.state.peer.host !== host) return sendJson(response, 409, { ok: false, error: "This device is already paired" });
-        this.state.peer = { host, name: cleanText(body.name, 40), pairedAt: this.state.peer?.pairedAt || nowIso() };
+        this.state.peer = { host, transport: TRANSPORT_MODE, name: cleanText(body.name, 40), pairedAt: this.state.peer?.pairedAt || nowIso() };
         this.state.peerProfile = normalizeProfile(body.profile || { name: body.name });
         this.state.peerOnline = true;
         this.state.peerLastSeen = nowIso();
@@ -401,12 +438,12 @@ class OmaBondDaemon {
   }
 
   async syncPeer() {
-    if (this.syncing || !this.state.peer || !this.secret || !this.tailInfo) return;
+    if (this.syncing || !this.state.peer || !this.secret || !this.networkInfo) return;
     this.syncing = true;
     try {
       await fetchPeer(this.state.peer.host, "/v1/hello", this.secret, {
         method: "POST",
-        body: { host: this.tailInfo.ip, name: this.state.profile.name, profile: this.state.profile }
+        body: { host: this.networkInfo.ip, name: this.state.profile.name, profile: this.state.profile }
       });
       const snapshot = await fetchPeer(this.state.peer.host, "/v1/snapshot", this.secret);
       this.state.peerProfile = normalizeProfile(snapshot.profile);
@@ -430,24 +467,24 @@ class OmaBondDaemon {
     }
   }
 
-  refreshTailscale() {
+  refreshTransport() {
     try {
-      const info = tailscaleInfo();
-      this.tailInfo = info;
-      this.tailError = "";
-      if (this.tailAddress !== info.ip) this.startTailServer(info.ip);
+      const info = transportInfo();
+      this.networkInfo = info;
+      this.networkError = "";
+      if (this.listenAddress !== info.ip) this.startPeerServer(info.ip);
     } catch (error) {
-      this.tailInfo = null;
-      this.tailError = cleanText(error.message || error, 300);
-      if (this.tailServer) { this.tailServer.close(); this.tailServer = null; this.tailAddress = ""; }
+      this.networkInfo = null;
+      this.networkError = cleanText(error.message || error, 300);
+      if (this.peerServer) { this.peerServer.close(); this.peerServer = null; this.listenAddress = ""; }
     }
   }
 
-  startTailServer(address) {
-    if (this.tailServer) this.tailServer.close();
+  startPeerServer(address) {
+    if (this.peerServer) this.peerServer.close();
     const server = http.createServer((request, response) => void this.handleRemote(request, response));
-    server.on("error", error => { this.tailError = `Could not listen on Tailscale: ${cleanText(error.message, 180)}`; });
-    server.listen(PORT, address, () => { this.tailServer = server; this.tailAddress = address; });
+    server.on("error", error => { this.networkError = `Could not listen on ${TRANSPORT_MODE}: ${cleanText(error.message, 180)}`; });
+    server.listen(PORT, address, () => { this.peerServer = server; this.listenAddress = address; });
   }
 
   async start() {
@@ -466,8 +503,8 @@ class OmaBondDaemon {
       this.localServer.listen(SOCKET_PATH, resolve);
     });
     fs.chmodSync(SOCKET_PATH, 0o600);
-    this.refreshTailscale();
-    setInterval(() => { this.refreshTailscale(); void this.syncPeer(); }, SYNC_INTERVAL_MS).unref();
+    this.refreshTransport();
+    setInterval(() => { this.refreshTransport(); void this.syncPeer(); }, SYNC_INTERVAL_MS).unref();
     process.stdout.write(`${JSON.stringify({ ok: true, operation: "daemon", socket: SOCKET_PATH, port: PORT })}\n`);
   }
 }
@@ -526,7 +563,9 @@ if (isMain) await main();
 export {
   MAX_MESSAGE_LENGTH,
   PORT,
+  TRANSPORT_MODE,
   cleanText,
+  lanInfo,
   normalizeHost,
   normalizeMessage,
   normalizeProfile,

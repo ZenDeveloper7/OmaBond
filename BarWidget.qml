@@ -1,4 +1,4 @@
-// OmaBond: private two-person presence, nudges, and chat over Tailscale.
+// OmaBond: private two-person presence, nudges, and chat over a selected transport.
 import QtQuick
 import QtQuick.Controls as QQC
 import Quickshell
@@ -86,6 +86,7 @@ BarWidget {
 
           Text {
             text: root.bondService && root.bondService.paired ? root.peerEmoji() : "💛"
+            textFormat: Text.PlainText
             color: root.bar ? root.bar.foreground : Color.foreground
             font.pixelSize: Style.font.title
           }
@@ -95,6 +96,7 @@ BarWidget {
 
             Text {
               text: root.bondService && root.bondService.paired ? root.peerName() : "OmaBond"
+              textFormat: Text.PlainText
               color: root.bar ? root.bar.foreground : Color.foreground
               font.family: Style.font.family
               font.pixelSize: Style.font.subtitle
@@ -104,11 +106,14 @@ BarWidget {
             Text {
               width: parent.width
               text: !root.bondService ? "Starting…"
-                : root.bondService.tailscaleError ? root.bondService.tailscaleError
+                : root.bondService.networkError ? root.bondService.networkError
                 : root.bondService.paired
-                  ? (root.bondService.peerOnline ? "Online through Tailscale"
+                  ? (root.bondService.peerOnline ? (root.bondService.transportMode === "lan" ? "Online on local network" : "Online through Tailscale")
                     : "Offline" + (root.bondService.peerLastSeen ? " · last seen " + root.formatTime(root.bondService.peerLastSeen) : ""))
-                  : (root.bondService.tailscale ? "Tailscale ready · " + root.bondService.tailscale.ip : "Checking Tailscale…")
+                  : (root.bondService.network
+                    ? (root.bondService.transportMode === "lan" ? "Local test mode · " : "Tailscale ready · ") + root.bondService.network.ip
+                    : "Checking network…")
+              textFormat: Text.PlainText
               color: root.bondService && root.bondService.peerOnline ? Color.accent
                 : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.35)
               font.family: Style.font.family
@@ -132,6 +137,7 @@ BarWidget {
           width: parent.width
           visible: root.bondService && root.bondService.errorText !== ""
           text: root.bondService ? root.bondService.errorText : ""
+          textFormat: Text.PlainText
           color: Color.urgent
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
@@ -217,7 +223,9 @@ BarWidget {
 
             Text {
               width: parent.width
-              text: "Both devices must be on the same tailnet, or mutually shared in Tailscale. Send the pairing code through a trusted private channel."
+              text: root.bondService && root.bondService.transportMode === "lan"
+                ? "Local test mode is unencrypted. Use it only on a trusted LAN, then switch back to Tailscale."
+                : "Both devices must be on the same tailnet, or mutually shared in Tailscale. Send the pairing code through a trusted private channel."
               color: root.bar ? root.bar.foreground : Color.foreground
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
@@ -231,7 +239,7 @@ BarWidget {
                 text: root.bondService && root.bondService.pairingCode ? "Replace pairing code" : "Create pairing code"
                 foreground: root.bar ? root.bar.foreground : Color.foreground
                 bordered: true
-                enabled: root.bondService && root.bondService.tailscale && !root.bondService.busy
+                enabled: root.bondService && root.bondService.network && !root.bondService.busy
                 opacity: enabled ? 1 : 0.45
                 onClicked: root.bondService.createPairingCode()
               }
@@ -240,7 +248,7 @@ BarWidget {
                 visible: root.bondService && root.bondService.pairingCode === ""
                 text: "Show existing code"
                 foreground: root.bar ? root.bar.foreground : Color.foreground
-                enabled: root.bondService && root.bondService.tailscale && !root.bondService.busy
+                enabled: root.bondService && root.bondService.network && !root.bondService.busy
                 onClicked: root.bondService.showPairingCode()
               }
             }
@@ -297,6 +305,7 @@ BarWidget {
                 anchors.margins: Style.space(10)
                 text: root.peerEmoji() + "  " + (root.bondService && root.bondService.peerProfile && root.bondService.peerProfile.status
                   ? root.bondService.peerProfile.status : root.peerName() + " has not set a status yet")
+                textFormat: Text.PlainText
                 color: root.bar ? root.bar.foreground : Color.foreground
                 font.family: Style.font.family
                 font.pixelSize: Style.font.body
@@ -358,6 +367,7 @@ BarWidget {
                     text: (modelData.direction === "out" ? "You" : (modelData.sender || root.peerName()))
                       + " · " + root.formatTime(modelData.sentAt)
                       + (modelData.direction === "out" && !modelData.delivered ? " · queued" : "")
+                    textFormat: Text.PlainText
                     color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.35)
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
@@ -366,6 +376,7 @@ BarWidget {
                   Text {
                     width: parent.width
                     text: modelData.text
+                    textFormat: Text.PlainText
                     color: root.bar ? root.bar.foreground : Color.foreground
                     font.family: Style.font.family
                     font.pixelSize: modelData.type === "nudge" ? Style.font.title : Style.font.bodySmall
