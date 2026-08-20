@@ -87,7 +87,7 @@ BarWidget {
           Text {
             text: root.bondService && root.bondService.paired ? root.peerEmoji() : "💛"
             color: root.bar ? root.bar.foreground : Color.foreground
-            font.pixelSize: Style.font.displaySmall
+            font.pixelSize: Style.font.title
           }
 
           Column {
