@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "zen.omabond",
+  "name": "OmaBond",
+  "version": "0.1.0",
+  "author": "ZenDeveloper7",
+  "license": "MIT",
+  "description": "Private Tailscale presence, statuses, nudges, and chat for two Omarchy systems.",
+  "homepage": "https://github.com/ZenDeveloper7/OmaBond",
+  "keywords": ["tailscale", "presence", "chat", "friends", "couples"],
+  "kinds": ["service", "bar-widget"],
+  "keepLoaded": true,
+  "activation": "on-demand",
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaBond",
+    "description": "Stay close through private Tailscale statuses, nudges, and messages.",
+    "category": "Social",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
