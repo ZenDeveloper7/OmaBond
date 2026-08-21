@@ -9,6 +9,7 @@ import {
   MAX_MESSAGE_LENGTH,
   PORT,
   cleanText,
+  fetchPeer,
   normalizeHost,
   normalizeMessage,
   normalizeProfile,
@@ -16,6 +17,7 @@ import {
   pairingCode,
   parsePairingCode,
   readStdinJson,
+  requireKeyringSuccess,
   secretMatches
 } from "../scripts/omabond.mjs";
 
@@ -63,6 +65,27 @@ test("bearer comparison rejects missing and partial secrets", () => {
   assert.equal(secretMatches(secret, secret), true);
   assert.equal(secretMatches(`Bearer ${secret.slice(1)}`, secret), false);
   assert.equal(secretMatches("", secret), false);
+});
+
+test("peer requests reject redirects before sending follow-up requests", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestOptions;
+  globalThis.fetch = async (_url, options) => {
+    requestOptions = options;
+    return new Response('{"ok":true}', { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+  try {
+    assert.deepEqual(await fetchPeer("100.64.0.1", "/v1/snapshot", "S".repeat(43)), { ok: true });
+    assert.equal(requestOptions.redirect, "error");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("failed keyring mutations are never treated as successful", () => {
+  assert.doesNotThrow(() => requireKeyringSuccess({ status: 0 }, "fallback"));
+  assert.throws(() => requireKeyringSuccess({ status: 1, stderr: "keyring locked" }, "fallback"), /keyring locked/);
+  assert.throws(() => requireKeyringSuccess({ status: null, error: { code: "ENOENT" } }, "fallback"), /secret-tool is required/);
 });
 
 test("profiles and messages are bounded and strip control characters", () => {

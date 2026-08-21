@@ -129,6 +129,11 @@ function keyring(args, input = undefined) {
   return spawnSync("secret-tool", args, { input, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], timeout: 5000 });
 }
 
+function requireKeyringSuccess(result, fallbackMessage) {
+  if (result.error?.code === "ENOENT") throw new Error("secret-tool is required but is not installed");
+  if (result.status !== 0) throw new Error(cleanText(result.stderr || fallbackMessage, 300));
+}
+
 function getPairSecret() {
   const result = keyring(["lookup", ...KEYRING_ATTRIBUTES]);
   if (result.error?.code === "ENOENT") throw new Error("secret-tool is required but is not installed");
@@ -138,13 +143,12 @@ function getPairSecret() {
 function storePairSecret(secret) {
   if (!/^[A-Za-z0-9_-]{43}$/.test(secret)) throw new Error("Invalid pairing secret");
   const result = keyring(["store", "--label=OmaBond pairing secret", ...KEYRING_ATTRIBUTES], `${secret}\n`);
-  if (result.error?.code === "ENOENT") throw new Error("secret-tool is required but is not installed");
-  if (result.status !== 0) throw new Error(cleanText(result.stderr || "Could not store the pairing secret", 300));
+  requireKeyringSuccess(result, "Could not store the pairing secret");
 }
 
 function clearPairSecret() {
   const result = keyring(["clear", ...KEYRING_ATTRIBUTES]);
-  if (result.error?.code === "ENOENT") throw new Error("secret-tool is required but is not installed");
+  requireKeyringSuccess(result, "Could not remove the pairing secret from the keyring");
 }
 
 function tailscaleInfo() {
@@ -240,6 +244,7 @@ function sendJson(response, status, payload) {
 async function fetchPeer(host, route, secret, options = {}) {
   const response = await fetch(`http://${normalizeHost(host, TRANSPORT_MODE)}:${PORT}${route}`, {
     method: options.method || "GET",
+    redirect: "error",
     headers: {
       Authorization: `Bearer ${secret}`,
       Accept: "application/json",
@@ -573,5 +578,7 @@ export {
   pairingCode,
   parsePairingCode,
   readStdinJson,
+  requireKeyringSuccess,
+  fetchPeer,
   secretMatches
 };
