@@ -5,7 +5,6 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import readline from "node:readline";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
@@ -14,6 +13,9 @@ const PORT = 42831;
 const TRANSPORT_MODE = process.env.OMABOND_TRANSPORT === "lan" ? "lan" : "tailscale";
 const LAN_IP_OVERRIDE = String(process.env.OMABOND_LAN_IP || "").trim();
 const MAX_BODY_BYTES = 16 * 1024;
+const MAX_PEER_RESPONSE_BYTES = 16 * 1024;
+const MAX_LOCAL_RESPONSE_BYTES = 512 * 1024;
+const MAX_RATE_CLIENTS = 256;
 const MAX_MESSAGES = 100;
 const MAX_OUTBOX = 50;
 const MAX_MESSAGE_LENGTH = 500;
@@ -32,6 +34,16 @@ function cleanText(value, limit) {
   return String(value || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, limit);
 }
 
+function cleanLabelText(value, limit) {
+  return cleanText(value, limit).replace(/<[^>]*>/g, "").replace(/[<>]/g, "");
+}
+
+function normalizeTimestamp(value, fallback = nowIso()) {
+  const text = cleanText(value, 64);
+  const parsed = Date.parse(text);
+  return text && Number.isFinite(parsed) ? new Date(parsed).toISOString() : fallback;
+}
+
 function normalizeHost(value, mode = TRANSPORT_MODE) {
   const host = String(value || "").trim().replace(/\.$/, "").toLowerCase();
   const parts = /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) ? host.split(".").map(Number) : [];
@@ -47,10 +59,10 @@ function normalizeHost(value, mode = TRANSPORT_MODE) {
 
 function normalizeProfile(raw = {}) {
   return {
-    name: cleanText(raw.name || os.userInfo().username || "OmaBond friend", 40),
-    emoji: cleanText(raw.emoji || "💛", 8) || "💛",
+    name: cleanLabelText(raw.name || os.userInfo().username || "OmaBond friend", 40),
+    emoji: cleanLabelText(raw.emoji || "💛", 8) || "💛",
     status: cleanText(raw.status, MAX_STATUS_LENGTH),
-    updatedAt: String(raw.updatedAt || nowIso())
+    updatedAt: normalizeTimestamp(raw.updatedAt)
   };
 }
 
@@ -66,7 +78,7 @@ function normalizeMessage(raw) {
     text,
     direction: raw.direction === "out" ? "out" : "in",
     sender: cleanText(raw.sender, 40),
-    sentAt: String(raw.sentAt || nowIso()),
+    sentAt: normalizeTimestamp(raw.sentAt),
     delivered: raw.delivered === true
   };
 }
@@ -95,8 +107,8 @@ function normalizeState(raw) {
       peer = {
         host: normalizeHost(raw.peer.host, transport),
         transport,
-        name: cleanText(raw.peer.name, 40),
-        pairedAt: String(raw.peer.pairedAt || nowIso())
+        name: cleanLabelText(raw.peer.name, 40),
+        pairedAt: normalizeTimestamp(raw.peer.pairedAt)
       };
     } catch (_) {}
   }
@@ -106,7 +118,7 @@ function normalizeState(raw) {
     peer,
     peerOnline: raw.peerOnline === true,
     peerProfile: raw.peerProfile ? normalizeProfile(raw.peerProfile) : null,
-    peerLastSeen: String(raw.peerLastSeen || ""),
+    peerLastSeen: raw.peerLastSeen ? normalizeTimestamp(raw.peerLastSeen, "") : "",
     messages: (Array.isArray(raw.messages) ? raw.messages : []).map(normalizeMessage).filter(Boolean).slice(-MAX_MESSAGES),
     outbox: (Array.isArray(raw.outbox) ? raw.outbox : []).map(normalizeMessage).filter(Boolean).slice(-MAX_OUTBOX)
   };
@@ -195,7 +207,7 @@ function transportInfo() {
 
 function pairingCode(payload) {
   const transport = payload.transport === "lan" ? "lan" : "tailscale";
-  const json = JSON.stringify({ v: 1, transport, host: normalizeHost(payload.host, transport), name: cleanText(payload.name, 40), token: payload.token });
+  const json = JSON.stringify({ v: 1, transport, host: normalizeHost(payload.host, transport), name: cleanLabelText(payload.name, 40), token: payload.token });
   return `omabond:v1:${Buffer.from(json).toString("base64url")}`;
 }
 
@@ -207,7 +219,7 @@ function parsePairingCode(value) {
   catch (_) { throw new Error("Invalid OmaBond pairing code"); }
   if (payload?.v !== 1 || !/^[A-Za-z0-9_-]{43}$/.test(String(payload?.token || ""))) throw new Error("Invalid OmaBond pairing code");
   const transport = payload.transport === "lan" ? "lan" : "tailscale";
-  return { transport, host: normalizeHost(payload.host, transport), name: cleanText(payload.name, 40), token: String(payload.token) };
+  return { transport, host: normalizeHost(payload.host, transport), name: cleanLabelText(payload.name, 40), token: String(payload.token) };
 }
 
 function secretMatches(header, secret) {
@@ -218,16 +230,30 @@ function secretMatches(header, secret) {
 }
 
 async function readJsonBody(request) {
+  const declaredLength = Number(request.headers?.["content-length"] || 0);
+  if (!Number.isSafeInteger(declaredLength) || declaredLength < 0 || declaredLength > MAX_BODY_BYTES) {
+    throw new Error("Request is too large");
+  }
+  return readBoundedJson(request, MAX_BODY_BYTES, {
+    emptyValue: {},
+    tooLargeMessage: "Request is too large",
+    invalidMessage: "Request body must be JSON"
+  });
+}
+
+async function readBoundedJson(stream, maxBytes, messages) {
   const chunks = [];
   let length = 0;
-  for await (const chunk of request) {
-    length += chunk.length;
-    if (length > MAX_BODY_BYTES) throw new Error("Request is too large");
-    chunks.push(chunk);
+  if (!stream) throw new Error(messages.invalidMessage);
+  for await (const chunk of stream) {
+    const buffer = Buffer.from(chunk);
+    length += buffer.length;
+    if (length > maxBytes) throw new Error(messages.tooLargeMessage);
+    chunks.push(buffer);
   }
-  if (!chunks.length) return {};
+  if (!chunks.length) return messages.emptyValue;
   try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
-  catch (_) { throw new Error("Request body must be JSON"); }
+  catch (_) { throw new Error(messages.invalidMessage); }
 }
 
 function sendJson(response, status, payload) {
@@ -253,11 +279,29 @@ async function fetchPeer(host, route, secret, options = {}) {
     body: options.body ? JSON.stringify(options.body) : undefined,
     signal: AbortSignal.timeout(4000)
   });
-  let payload;
-  try { payload = await response.json(); }
-  catch (_) { throw new Error(`Peer returned an unreadable response (${response.status})`); }
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (!Number.isSafeInteger(declaredLength) || declaredLength < 0 || declaredLength > MAX_PEER_RESPONSE_BYTES) {
+    throw new Error(`Peer response is too large (${response.status})`);
+  }
+  const payload = await readBoundedJson(response.body, MAX_PEER_RESPONSE_BYTES, {
+    emptyValue: null,
+    tooLargeMessage: `Peer response is too large (${response.status})`,
+    invalidMessage: `Peer returned an unreadable response (${response.status})`
+  });
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new Error(`Peer returned an unreadable response (${response.status})`);
+  }
   if (!response.ok || payload.ok !== true) throw new Error(cleanText(payload.error || `Peer request failed (${response.status})`, 300));
   return payload;
+}
+
+function hardenHttpServer(server) {
+  server.requestTimeout = 5000;
+  server.headersTimeout = 5000;
+  server.keepAliveTimeout = 1000;
+  server.timeout = 5000;
+  server.maxRequestsPerSocket = 100;
+  return server;
 }
 
 function publicState(state, daemon) {
@@ -307,6 +351,10 @@ class OmaBondDaemon {
   rateAllowed(address) {
     const key = String(address || "unknown");
     const now = Date.now();
+    for (const [storedKey, storedEntry] of this.rate) {
+      if (now - storedEntry.started >= 60000) this.rate.delete(storedKey);
+    }
+    if (!this.rate.has(key) && this.rate.size >= MAX_RATE_CLIENTS) return false;
     const entry = this.rate.get(key) || { started: now, count: 0 };
     if (now - entry.started >= 60000) { entry.started = now; entry.count = 0; }
     entry.count++;
@@ -415,7 +463,7 @@ class OmaBondDaemon {
         const host = normalizeHost(body.host, TRANSPORT_MODE);
         if (this.networkInfo && host === this.networkInfo.ip) throw new Error("Peer endpoint cannot be this device");
         if (this.state.peer && this.state.peer.host !== host) return sendJson(response, 409, { ok: false, error: "This device is already paired" });
-        this.state.peer = { host, transport: TRANSPORT_MODE, name: cleanText(body.name, 40), pairedAt: this.state.peer?.pairedAt || nowIso() };
+        this.state.peer = { host, transport: TRANSPORT_MODE, name: cleanLabelText(body.name, 40), pairedAt: this.state.peer?.pairedAt || nowIso() };
         this.state.peerProfile = normalizeProfile(body.profile || { name: body.name });
         this.state.peerOnline = true;
         this.state.peerLastSeen = nowIso();
@@ -453,7 +501,7 @@ class OmaBondDaemon {
       const snapshot = await fetchPeer(this.state.peer.host, "/v1/snapshot", this.secret);
       this.state.peerProfile = normalizeProfile(snapshot.profile);
       this.state.peerOnline = true;
-      this.state.peerLastSeen = String(snapshot.seenAt || nowIso());
+      this.state.peerLastSeen = normalizeTimestamp(snapshot.seenAt);
       const remaining = [];
       for (const event of this.state.outbox) {
         try {
@@ -487,7 +535,7 @@ class OmaBondDaemon {
 
   startPeerServer(address) {
     if (this.peerServer) this.peerServer.close();
-    const server = http.createServer((request, response) => void this.handleRemote(request, response));
+    const server = hardenHttpServer(http.createServer((request, response) => void this.handleRemote(request, response)));
     server.on("error", error => { this.networkError = `Could not listen on ${TRANSPORT_MODE}: ${cleanText(error.message, 180)}`; });
     server.listen(PORT, address, () => { this.peerServer = server; this.listenAddress = address; });
   }
@@ -502,7 +550,7 @@ class OmaBondDaemon {
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
     }
-    this.localServer = http.createServer((request, response) => void this.handleLocal(request, response));
+    this.localServer = hardenHttpServer(http.createServer((request, response) => void this.handleLocal(request, response)));
     await new Promise((resolve, reject) => {
       this.localServer.once("error", reject);
       this.localServer.listen(SOCKET_PATH, resolve);
@@ -515,14 +563,11 @@ class OmaBondDaemon {
 }
 
 async function readStdinJson(input = process.stdin) {
-  const reader = readline.createInterface({ input, crlfDelay: Infinity });
-  for await (const line of reader) {
-    const text = String(line || "").trim();
-    if (!text) return {};
-    try { return JSON.parse(text); }
-    catch (_) { throw new Error("OmaBond input must be JSON"); }
-  }
-  return {};
+  return readBoundedJson(input, MAX_BODY_BYTES, {
+    emptyValue: {},
+    tooLargeMessage: "OmaBond input is too large",
+    invalidMessage: "OmaBond input must be JSON"
+  });
 }
 
 async function localRequest(operation, input = {}) {
@@ -530,13 +575,23 @@ async function localRequest(operation, input = {}) {
     const body = JSON.stringify({ operation, input });
     const request = http.request({ socketPath: SOCKET_PATH, path: "/command", method: "POST", headers: {
       "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body)
-    } }, response => {
-      const chunks = [];
-      response.on("data", chunk => chunks.push(chunk));
-      response.on("end", () => {
-        try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); }
-        catch (_) { reject(new Error("OmaBond service returned an unreadable response")); }
-      });
+    } }, async response => {
+      const declaredLength = Number(response.headers["content-length"] || 0);
+      if (!Number.isSafeInteger(declaredLength) || declaredLength < 0 || declaredLength > MAX_LOCAL_RESPONSE_BYTES) {
+        response.destroy();
+        reject(new Error("OmaBond service response is too large"));
+        return;
+      }
+      try {
+        resolve(await readBoundedJson(response, MAX_LOCAL_RESPONSE_BYTES, {
+          emptyValue: null,
+          tooLargeMessage: "OmaBond service response is too large",
+          invalidMessage: "OmaBond service returned an unreadable response"
+        }));
+      } catch (error) {
+        response.destroy();
+        reject(error);
+      }
     });
     request.setTimeout(5000, () => request.destroy(new Error("OmaBond service timed out")));
     request.on("error", reject);
@@ -566,18 +621,25 @@ const isMain = process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).h
 if (isMain) await main();
 
 export {
+  MAX_BODY_BYTES,
+  MAX_PEER_RESPONSE_BYTES,
+  MAX_RATE_CLIENTS,
   MAX_MESSAGE_LENGTH,
+  OmaBondDaemon,
   PORT,
   TRANSPORT_MODE,
+  cleanLabelText,
   cleanText,
   lanInfo,
   normalizeHost,
   normalizeMessage,
   normalizeProfile,
   normalizeState,
+  normalizeTimestamp,
   pairingCode,
   parsePairingCode,
   readStdinJson,
+  readBoundedJson,
   requireKeyringSuccess,
   fetchPeer,
   secretMatches

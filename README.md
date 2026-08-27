@@ -62,7 +62,7 @@ OmaBond uses TCP port `42831` on each device's Tailscale IPv4 address. A restric
 
 ## Privacy and security model
 
-Tailscale provides authenticated WireGuard transport encryption between the devices. OmaBond adds a randomly generated 256-bit pairing secret stored in the desktop keyring and requires it on every peer request. The peer listener accepts only Tailscale CGNAT addresses from pairing codes, rate-limits requests, caps request bodies, and validates all stored fields.
+Tailscale provides authenticated WireGuard transport encryption between the devices. OmaBond adds a randomly generated 256-bit pairing secret stored in the desktop keyring and requires it on every peer request. The peer listener accepts only Tailscale CGNAT addresses from pairing codes, rate-limits requests with bounded bookkeeping, caps request and response bodies, applies short HTTP timeouts, and validates all stored fields.
 
 The local QML client talks to the helper through an owner-only Unix socket under `XDG_RUNTIME_DIR`. The peer service binds only to the local device's Tailscale IPv4 address. Pairing secrets and message text are passed to helper commands through standard input instead of process arguments.
 

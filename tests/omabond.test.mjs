@@ -6,16 +6,23 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  MAX_BODY_BYTES,
+  MAX_PEER_RESPONSE_BYTES,
+  MAX_RATE_CLIENTS,
   MAX_MESSAGE_LENGTH,
+  OmaBondDaemon,
   PORT,
+  cleanLabelText,
   cleanText,
   fetchPeer,
   normalizeHost,
   normalizeMessage,
   normalizeProfile,
   normalizeState,
+  normalizeTimestamp,
   pairingCode,
   parsePairingCode,
+  readBoundedJson,
   readStdinJson,
   requireKeyringSuccess,
   secretMatches
@@ -82,6 +89,71 @@ test("peer requests reject redirects before sending follow-up requests", async (
   }
 });
 
+test("peer responses are rejected when Content-Length exceeds the limit", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('{"ok":true}', {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": String(MAX_PEER_RESPONSE_BYTES + 1)
+    }
+  });
+  try {
+    await assert.rejects(fetchPeer("100.64.0.1", "/v1/snapshot", "S".repeat(43)), /response is too large/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("peer responses are bounded while streaming when Content-Length is absent or false", async () => {
+  const originalFetch = globalThis.fetch;
+  for (const declaredLength of [undefined, "1"]) {
+    globalThis.fetch = async () => {
+      const headers = { "Content-Type": "application/json" };
+      if (declaredLength !== undefined) headers["Content-Length"] = declaredLength;
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(Buffer.from('{"ok":true,"padding":"'));
+          controller.enqueue(Buffer.alloc(MAX_PEER_RESPONSE_BYTES, 120));
+          controller.enqueue(Buffer.from('"}'));
+          controller.close();
+        }
+      }), { status: 200, headers });
+    };
+    try {
+      await assert.rejects(fetchPeer("100.64.0.1", "/v1/snapshot", "S".repeat(43)), /response is too large/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+});
+
+test("bounded JSON parsing accepts the limit and rejects the next byte", async () => {
+  const valid = Buffer.from('{"ok":true}');
+  assert.deepEqual(await readBoundedJson(Readable.from([valid]), valid.length, {
+    emptyValue: null,
+    tooLargeMessage: "too large",
+    invalidMessage: "invalid"
+  }), { ok: true });
+  await assert.rejects(readBoundedJson(Readable.from([Buffer.alloc(MAX_BODY_BYTES + 1)]), MAX_BODY_BYTES, {
+    emptyValue: null,
+    tooLargeMessage: "too large",
+    invalidMessage: "invalid"
+  }), /too large/);
+});
+
+test("peer responses must be JSON objects", async () => {
+  const originalFetch = globalThis.fetch;
+  for (const body of ["null", "[]", "not-json"]) {
+    globalThis.fetch = async () => new Response(body, { status: 200 });
+    try {
+      await assert.rejects(fetchPeer("100.64.0.1", "/v1/snapshot", "S".repeat(43)), /unreadable response/);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+});
+
 test("failed keyring mutations are never treated as successful", () => {
   assert.doesNotThrow(() => requireKeyringSuccess({ status: 0 }, "fallback"));
   assert.throws(() => requireKeyringSuccess({ status: 1, stderr: "keyring locked" }, "fallback"), /keyring locked/);
@@ -89,8 +161,9 @@ test("failed keyring mutations are never treated as successful", () => {
 });
 
 test("profiles and messages are bounded and strip control characters", () => {
-  const profile = normalizeProfile({ name: " A\u0000lice ", emoji: "💛", status: "x".repeat(200) });
+  const profile = normalizeProfile({ name: " A\u0000lice<img> ", emoji: "<b>💛", status: "x".repeat(200) });
   assert.equal(profile.name, "A lice");
+  assert.equal(profile.emoji, "💛");
   assert.equal(profile.status.length, 80);
 
   const message = normalizeMessage({
@@ -103,6 +176,9 @@ test("profiles and messages are bounded and strip control characters", () => {
   assert.equal(message.direction, "out");
   assert.equal(normalizeMessage({ id: "unsafe", text: "hi" }), null);
   assert.equal(cleanText(" a\tb ", 20), "a b");
+  assert.equal(cleanLabelText("<b>Alice</b>", 40), "Alice");
+  assert.equal(normalizeTimestamp("2026-08-27T10:00:00Z"), "2026-08-27T10:00:00.000Z");
+  assert.equal(normalizeTimestamp("x".repeat(MAX_BODY_BYTES), "fallback"), "fallback");
 });
 
 test("state normalization rejects unsafe peers and caps history", () => {
@@ -120,6 +196,17 @@ test("client input is parsed from stdin instead of command arguments", async () 
   const input = Readable.from(['{"text":"private hello"}\n']);
   assert.deepEqual(await readStdinJson(input), { text: "private hello" });
   await assert.rejects(readStdinJson(Readable.from(["not-json\n"])), /input must be JSON/);
+  await assert.rejects(readStdinJson(Readable.from([Buffer.alloc(MAX_BODY_BYTES + 1)])), /input is too large/);
+});
+
+test("rate-limit bookkeeping has a fixed memory bound", () => {
+  const daemon = new OmaBondDaemon();
+  for (let index = 0; index < MAX_RATE_CLIENTS; index++) {
+    assert.equal(daemon.rateAllowed(`peer-${index}`), true);
+  }
+  assert.equal(daemon.rate.size, MAX_RATE_CLIENTS);
+  assert.equal(daemon.rateAllowed("one-peer-too-many"), false);
+  assert.equal(daemon.rate.size, MAX_RATE_CLIENTS);
 });
 
 test("peer-controlled QML Text values are always rendered as plain text", () => {

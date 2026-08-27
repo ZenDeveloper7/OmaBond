@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "zen.omabond",
   "name": "OmaBond",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "ZenDeveloper7",
   "license": "MIT",
   "description": "Private Tailscale presence, statuses, nudges, and chat for two Omarchy systems.",
